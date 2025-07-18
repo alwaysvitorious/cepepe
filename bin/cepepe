@@ -1,0 +1,588 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Usage: cepepe.sh <project-name>
+# -----------------------------------------------------------------------------
+usage() {
+  echo "Usage: $(basename "$0") <project-name>"
+  exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+proj="$1"
+
+# -----------------------------------------------------------------------------
+# Prompt for HTTP or plain C++
+# -----------------------------------------------------------------------------
+read -p "Will this be an HTTP server? [y/N] " answer
+# Default to “no” on empty
+if [[ -z "$answer" ]]; then
+  answer="n"
+fi
+
+# Portable check for “yes”
+case "$answer" in
+  [Yy]* ) is_http=true ;;
+  *     ) is_http=false ;;
+esac
+
+echo "⟳ Scaffolding project '$proj' (HTTP=$is_http)…"
+
+
+# -----------------------------------------------------------------------------
+# Nix check & upgrade
+# -----------------------------------------------------------------------------
+if ! command -v nix >/dev/null 2>&1; then
+  cat <<EOF
+
+Nix not found! Install via:
+
+  curl --proto '=https' --tlsv1.2 -sSf \
+    -L https://install.determinate.systems/nix | sh -s -- install --determinate
+
+EOF
+  exit 1
+fi
+
+echo "⟳ Upgrading determinate-nixd…"
+sudo determinate-nixd upgrade || {
+  echo "Make sure you have a NOPASSWD sudoers entry for determinate-nixd."
+  exit 1
+}
+
+# -----------------------------------------------------------------------------
+# Bootstrap project directory
+# -----------------------------------------------------------------------------
+mkdir -p "$proj"
+cd "$proj"
+
+# Common files
+cat > .clangformat <<'EOF'
+---
+Language: Cpp
+BasedOnStyle: Google
+BreakBeforeBraces: Allman
+BraceWrapping:
+  AfterFunction: true
+BinPackParameters: false
+AllowAllParametersOfDeclarationOnNextLine: false
+EOF
+
+cat > .gitignore <<'EOF'
+.DS_Store
+.vscode
+build*/
+.env*
+static
+uploads
+*.db
+*.sqlite3
+data
+EOF
+
+# flake.nix
+echo
+read -p "Enter nixpkgs branch to use [default: ${latest_tag:-unstable}]: " user_input
+latest_tag="${user_input:-${latest_tag:-unstable}}"
+
+echo "✔️  Using nixpkgs input: $latest_tag"
+
+
+cat > flake.nix <<EOF
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-${latest_tag}";
+  };
+
+  outputs = { self, nixpkgs }:
+    let
+      supportedSystems = [ "aarch64-darwin" "aarch64-linux" ];
+      forEachSupportedSystem = f: nixpkgs.lib.genAttrs supportedSystems (system: f {
+        pkgs = import nixpkgs { inherit system; };
+      });
+    in {
+      devShells = forEachSupportedSystem ({ pkgs }: {
+        default = pkgs.mkShell {
+          packages = with pkgs; [
+            pkg-config
+            cmake
+            llvmPackages_19.clang
+            cppcheck
+EOF
+
+if $is_http; then
+  cat >> flake.nix <<'EOF'
+            gzip
+            (drogon.override {
+                    sqliteSupport = false;
+            })
+EOF
+fi
+
+cat >> flake.nix <<'EOF'
+          ];
+
+          shellHook = ''
+            export CC=\${pkgs.llvmPackages_19.clang}/bin/clang
+            export CXX=\${pkgs.llvmPackages_19.clang}/bin/clang++
+            export CMAKE_C_COMPILER=$CC
+            export CMAKE_CXX_COMPILER=$CXX
+EOF
+
+cat >> flake.nix <<'EOF'
+          '';
+        };
+
+        production = pkgs.mkShell {
+          packages = with pkgs; [
+            pkg-config
+            cmake
+            llvmPackages_19.clang
+EOF
+
+if $is_http; then
+  cat >> flake.nix <<'EOF'
+            gzip
+            (drogon.override {
+                    sqliteSupport = false;
+            })
+EOF
+fi
+
+cat >> flake.nix <<'EOF'
+          ];
+
+          shellHook = ''
+            export CC=\${pkgs.llvmPackages_19.clang}/bin/clang
+            export CXX=\${pkgs.llvmPackages_19.clang}/bin/clang++
+            export CMAKE_C_COMPILER=$CC
+            export CMAKE_CXX_COMPILER=$CXX
+          '';
+        };
+      });
+    };
+}
+EOF
+
+
+# -----------------------------------------------------------------------------
+# Scaffold HTTP or plain layout
+# -----------------------------------------------------------------------------
+if $is_http; then
+  mkdir -p backend/controller frontend
+  cat > backend/main.cc <<'EOF'
+#include <drogon/drogon.h>
+
+#include <exception>
+
+#include "./controller/controller.h"
+
+int main()
+{
+  LOG_INFO << "Starting server...";
+
+  try
+  {
+    drogon::app().loadConfigFile("config.json");
+    LOG_INFO << "Config file loaded.";
+
+    drogon::app()
+        .setMaxConnectionNumPerIP(5)
+        .setLogLevel(trantor::Logger::LogLevel::kDebug)
+        .registerHttpResponseCreationAdvice(
+            [](const drogon::HttpResponsePtr &resp)
+            {
+              resp->addHeader("X-Content-Type-Options", "nosniff");
+              resp->addHeader("X-Frame-Options", "DENY");
+              resp->addHeader("Referrer-Policy", "no-referrer");
+              resp->addHeader("X-XSS-Protection", "0");
+              resp->addHeader("Strict-Transport-Security",
+                              "max-age=63072000; includeSubDomains; "
+                              "preload");
+              resp->addHeader("Cross-Origin-Opener-Policy", "same-origin");
+              resp->addHeader("Cross-Origin-Embedder-Policy", "require-corp");
+              resp->addHeader("Cross-Origin-Resource-Policy", "same-origin");
+              resp->addHeader("Permissions-Policy",
+                              "accelerometer=(), autoplay=(), camera=(), "
+                              "geolocation=(), gyroscope=(), magnetometer=(), "
+                              "microphone=(), payment=(), usb=()");
+              resp->addHeader("Content-Security-Policy",
+                              "default-src 'self'; "
+                              "script-src 'self' 'unsafe-inline'; "
+                              "style-src  'self' 'unsafe-inline'; "
+                              "font-src   'self'; "
+                              "img-src   'self' data:; "
+                              "object-src 'none'; "
+                              "base-uri  'self'; "
+                              "form-action 'none'; "
+                              "frame-ancestors 'none'; "
+                              "upgrade-insecure-requests; "
+                              "require-trusted-types-for 'script';");
+            });
+
+    drogon::app().setCustom404Page(
+        drogon::HttpResponse::newFileResponse("./build/index.html"));
+    LOG_INFO << "404 page set to index.html";
+
+    LOG_INFO << "Drogon running with " << drogon::app().getThreadNum()
+             << " threads.";
+
+    drogon::app().run();
+
+    LOG_WARN << "Server stopped.";
+  }
+  catch (const std::exception &e)
+  {
+    LOG_ERROR << "Exception during server execution: " << e.what();
+    return EXIT_FAILURE;
+  }
+  catch (...)
+  {
+    LOG_ERROR << "Unknown error during server execution.";
+    return EXIT_FAILURE;
+  }
+
+  return EXIT_SUCCESS;
+}
+EOF
+
+  cat > backend/controller/controller.h <<'EOF'
+#ifndef CONTROLLER_H
+#define CONTROLLER_H
+
+#include <drogon/HttpController.h>
+#include <drogon/drogon.h>
+
+#include <functional>
+
+class ControllerClass : public drogon::HttpController<ControllerClass>
+{
+ public:
+  METHOD_LIST_BEGIN
+  ADD_METHOD_TO(ControllerClass::home, "/", drogon::Get);
+  ADD_METHOD_TO(ControllerClass::checkHealth, "/health", drogon::Get);
+  METHOD_LIST_END
+
+ private:
+  void home(const drogon::HttpRequestPtr &req [[maybe_unused]],
+            std::function<void(const drogon::HttpResponsePtr &)> &&callback)
+  {
+    auto resp = drogon::HttpResponse::newHttpJsonResponse(
+        Json::Value{{"message", "Hello from cepepe!"}});
+    callback(resp);
+  }
+
+  void checkHealth(
+      const drogon::HttpRequestPtr &req [[maybe_unused]],
+      std::function<void(const drogon::HttpResponsePtr &)> &&callback)
+  {
+    try
+    {
+      auto resp = drogon::HttpResponse::newHttpResponse();
+      resp->setStatusCode(drogon::k200OK);
+      callback(resp);
+    }
+    catch (...)
+    {
+      auto resp = drogon::HttpResponse::newHttpResponse();
+      resp->setStatusCode(drogon::k503ServiceUnavailable);
+      callback(resp);
+    }
+  }
+};
+
+#endif  // CONTROLLER_H
+EOF
+
+  cat > config.json <<'EOF'
+{
+	"listeners": [
+		{
+			"address": "0.0.0.0",
+			"port": 80,
+			// SSL on load balancer
+			"https": false
+		}
+	],
+	"app": {
+		// 0: all available cores ->
+		"number_of_threads": 0,
+		"use_implicit_pages": false,
+		"document_root": "./build",
+		"home_page": "index.html",
+		"enable_session": false,
+		"session_same_site": "Strict",
+		"max_connections": 100000,
+		"use_gzip": false,
+		"client_max_body_size": "16K",
+		"client_max_memory_body_size": "16K",
+		"reuse_port": false,
+		"static_files_cache_time": 300,
+		"upload_path": "./uploads",
+		"idle_connection_timeout": 60,
+		"enable_server_header": false,
+		"file_types": ["html", "webp", "woff2", "txt"],
+		"log": {
+			"display_local_time": true
+		}
+	},
+	"plugins": [
+		{
+			"name": "drogon::plugin::Hodor",
+			"dependencies": ["drogon::plugin::RealIpResolver"],
+			"config": {
+				"algorithm": "token_bucket",
+				"urls": [],
+				"time_unit": 60,
+				"capacity": 30000,
+				"ip_capacity": 200,
+				// "capacity": 12000,
+				// "ip_capacity": 40,
+				"multi_threads": true,
+				"limiter_expire_time": 300,
+				"use_real_ip_resolver": true,
+				"rejection_message": "Too many requests — please slow down :)"
+			}
+		},
+		{
+			"name": "drogon::plugin::RealIpResolver",
+			"dependencies": [],
+			"config": {
+				// Trusted proxy ipv4 or cidr -> load balancer IP
+				"trust_ips": ["172.31.0.0/16"],
+				// Which header to parse ip form. Default: x-forwarded-for
+				"from_header": "x-forwarded-for",
+				// The result will be inserted to HttpRequest attribute map with this
+				// key. Default is "real-ip"
+				"attribute_key": "real-ip"
+			}
+		}
+	]
+}
+EOF
+
+  cat > frontend/index.html <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>cepepe</title>
+  ...
+EOF
+fi
+
+# CMakeLists.txt
+cat > CMakeLists.txt <<EOF
+cmake_minimum_required(VERSION 3.20)
+project(${proj})
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(CMAKE_CXX_FLAGS "\${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+    set(CMAKE_EXE_LINKER_FLAGS "\${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+    message(STATUS ">>> Address Sanitizer enabled for Debug build")
+endif()
+
+EOF
+
+if $is_http; then
+  cat >> CMakeLists.txt <<EOF
+file(GLOB_RECURSE SOURCE_FILES
+  \${CMAKE_CURRENT_SOURCE_DIR}/backend/*.cc
+  \${CMAKE_CURRENT_SOURCE_DIR}/backend/*.h
+)
+
+add_executable(${proj} \${SOURCE_FILES})
+
+find_package(Drogon CONFIG REQUIRED)
+
+# Basic linking - Nix handles most dependency management
+set(PLATFORM_LIBS "")
+
+target_link_libraries(
+    ${proj} 
+    PRIVATE 
+        Drogon::Drogon
+        \${PLATFORM_LIBS}
+)
+
+target_include_directories(
+    ${proj} 
+    PRIVATE 
+        \${CMAKE_CURRENT_SOURCE_DIR}/backend
+        \${CMAKE_BINARY_DIR}
+)
+EOF
+
+else
+ cat >> CMakeLists.txt <<EOF
+file(GLOB_RECURSE SOURCE_FILES
+  \${CMAKE_CURRENT_SOURCE_DIR}/*.cc
+  \${CMAKE_CURRENT_SOURCE_DIR}/*.h
+)
+
+add_executable(${proj} \${SOURCE_FILES})
+
+# find_package()
+
+# Basic linking - Nix handles most dependency management
+set(PLATFORM_LIBS "")
+
+target_link_libraries(
+    ${proj} 
+    PRIVATE 
+        \${PLATFORM_LIBS}
+)
+
+target_include_directories(
+    ${proj} 
+    PRIVATE 
+        \${CMAKE_CURRENT_SOURCE_DIR}
+        \${CMAKE_BINARY_DIR}
+)
+EOF
+fi
+
+cat >> CMakeLists.txt <<EOF
+
+target_compile_options(
+    ${proj}  
+    PRIVATE
+        -Wall      # All common warnings
+        -Wextra    # Extra warnings
+        -Wpedantic # Strict standard compliance
+        -Werror    # Warnings as errors
+)
+EOF
+
+# -----------------------------------------------------------------------------
+# Generate build.sh
+# -----------------------------------------------------------------------------
+cat > build.sh <<'EOF'
+# build.sh
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+usage() {
+    echo "Options:"
+    echo "  --clean             Clean build directory before building."
+    echo "  --debug             Build on debug mode."
+    exit 1
+}
+
+CLEAN=false
+DEBUG=false
+ORIGINAL_ARGS=("$@")
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    --clean)
+        CLEAN=true
+        shift
+        ;;
+    --debug)
+        DEBUG=true
+        shift
+        ;;
+    *)
+        echo "Error: Invalid argument '$1'."
+        usage
+        ;;
+    esac
+done
+
+# ----------------------------------------------------------------------
+# Set up build directory
+# ----------------------------------------------------------------------
+BUILD_DIR="build"
+if [ "$CLEAN" = true ]; then
+    echo "Cleaning build directory..."
+    rm -rf "$BUILD_DIR"
+fi
+mkdir -p "$BUILD_DIR"
+
+# If not in nix shell -> enter nix develop -> re-run script
+if [ -z "$IN_NIX_SHELL" ]; then
+    echo "Entering the nix development environment..."
+    exec nix develop --command "$0" "${ORIGINAL_ARGS[@]}"
+fi
+
+echo "Running cppcheck..."
+cppcheck --check-level=exhaustive --error-exitcode=1 backend
+
+# Configure build
+echo -e "\nConfiguring the project..."
+
+# Create CMake options based on arguments
+CMAKE_OPTIONS=()
+if [ "$DEBUG" = true ]; then
+    CMAKE_OPTIONS+=(-DCMAKE_BUILD_TYPE=Debug)
+else
+    CMAKE_OPTIONS+=(-DCMAKE_BUILD_TYPE=Release)
+    CMAKE_OPTIONS+=(-DCMAKE_CXX_FLAGS="-O3")
+fi
+
+echo "CMake options: ${CMAKE_OPTIONS[*]}"
+
+# Log compiler and toolchain
+echo "Using CC: $CC"
+echo "Using CXX: $CXX"
+
+cmake -B "$BUILD_DIR" -S . "${CMAKE_OPTIONS[@]}"
+
+# Determine nb of cores
+NUM_CORES=$(sysctl -n hw.ncpu || nproc || echo 4)
+
+# Build
+echo -e "\nBuilding the project..."
+if [ "$DEBUG" = true ]; then
+    # Warning! "If a part of the application is built with asan and another part is not instrumented,
+    # and both parts use e.g. instrumented std::vector, asan may report non-existent container overflow."
+EOF
+cat >> build.sh <<EOF
+    # -> when needed run with ASAN_OPTIONS=detect_container_overflow=0 ./build/${proj}
+EOF
+cat >> build.sh <<'EOF'
+    # export ASAN_OPTIONS=detect_container_overflow=0
+    cmake --build "$BUILD_DIR" -- -j"$NUM_CORES" VERBOSE=1
+else
+    cmake --build "$BUILD_DIR" -- -j"$NUM_CORES"
+fi
+EOF
+
+# Only for HTTP scaffolds, append frontend copy/gzip block
+if $is_http; then
+  cat >> build.sh <<'EOF'
+
+# HTTP‑only: copy & compress frontend
+echo "⟳ Moving frontend files…"
+cp -r frontend/* "$BUILD_DIR"
+
+echo "⟳ Gzipping HTML…"
+find "$BUILD_DIR" -type f -iname '*.html' -exec gzip -k9 {} \;
+
+echo "⟳ Compressed files:"
+find "$BUILD_DIR" -name '*.gz'
+EOF
+fi
+
+# Append the tail (file + exit)
+cat >> build.sh <<EOF
+
+echo
+file \$BUILD_DIR/${proj}
+
+echo -e "\n✅ Build complete.\n"
+exit 0
+EOF
+
+chmod +x build.sh
+
+
+echo "✅ Bootstrapped project '$proj' (HTTP=$is_http)"

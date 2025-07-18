@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# Usage: cepepe.sh <project-name>
+# Usage: cepepe <project-name>
 # -----------------------------------------------------------------------------
 usage() {
   echo "Usage: $(basename "$0") <project-name>"

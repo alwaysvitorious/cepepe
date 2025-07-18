@@ -16,9 +16,9 @@ and flexible **CMake** templates.
 
 ## Requirements
 
-- [Nix](https://nixos.org) (cepepe checks and prompts you if it’s missing). You
-  can use [Determinate Nix](https://docs.determinate.systems/#products).
-- `determinate-nixd` (with a NOPASSWD sudoer entry so `upgrade` never asks)
+- [Nix](https://nixos.org) (`cepepe` checks and prompts you if it’s missing).
+  You can use [Determinate Nix](https://docs.determinate.systems/#products).
+  `cepepe` checks of updates using determinate-nixd.
 
 ## Installation
 

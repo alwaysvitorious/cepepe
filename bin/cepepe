@@ -41,15 +41,19 @@ Nix not found! Install via:
   curl --proto '=https' --tlsv1.2 -sSf \
     -L https://install.determinate.systems/nix | sh -s -- install --determinate
 
+Or check:
+    https://docs.determinate.systems/#products
 EOF
   exit 1
 fi
 
-echo "⟳ Upgrading determinate-nixd…"
-sudo determinate-nixd upgrade || {
-  echo "Make sure you have a NOPASSWD sudoers entry for determinate-nixd."
-  exit 1
-}
+if command -v determinate-nixd >/dev/null 2>&1; then
+  echo "⟳ Upgrading determinate-nixd…"
+  sudo determinate-nixd upgrade
+else
+  echo "⚠ determinate-nixd not found; skipping upgrade."
+fi
+
 
 # -----------------------------------------------------------------------------
 # Bootstrap project directory

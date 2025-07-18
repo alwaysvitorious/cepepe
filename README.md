@@ -16,7 +16,8 @@ and flexible **CMake** templates.
 
 ## Requirements
 
-- [Nix](https://nixos.org) (cepepe checks and prompts you if it’s missing)
+- [Nix](https://nixos.org) (cepepe checks and prompts you if it’s missing). You
+  can use [Determinate Nix](https://docs.determinate.systems/#products).
 - `determinate-nixd` (with a NOPASSWD sudoer entry so `upgrade` never asks)
 
 ## Installation
@@ -34,4 +35,5 @@ sudo ln -fs "$(pwd)/bin/cepepe" /usr/local/bin/cepepe
 cd ~/projects
 cepepe myapp
 # → “Will this be an HTTP server? [y/N]”
+...
 ```
